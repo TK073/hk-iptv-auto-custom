@@ -120,11 +120,6 @@ TEST_BUDGET_SECONDS = 600
 # 对播放器来说这等於不可用，所以延迟超上限直接判死。
 MAX_ACCEPTABLE_DELAY_MS = 5000
 
-# 二次复检轮数：初筛通过的源再测一轮，两轮都过才进订阅表。
-# 实测港版首轮 83 条「可播」里，几分钟后立刻复测有 49 条（59%）已经连不上，
-# 单次抽样的结论不足以代表「可用」。设为 1 即关闭复检。
-REVALIDATE_ROUNDS = 2
-
 TARGET_README_URLS = [
     "https://raw.githubusercontent.com/youhunwl/TVAPP/main/README.md",
     "https://raw.githubusercontent.com/ngo5/IPTV/main/README.md",
@@ -652,41 +647,6 @@ def generate_m3u(channels: list):
         print(f"\n🔬 ffprobe 解码校验剔除 {len(decode_rejects)} 条「能下载但无视频轨」的源：", flush=True)
         for c_name, c_url, reason in decode_rejects:
             print(f"  ⛔ {c_name} | {reason} | {c_url[:80]}", flush=True)
-
-    if REVALIDATE_ROUNDS >= 2:
-        finalists = [it for lst in channel_test_results.values() for it in lst]
-        if finalists:
-            print(f"\n🔁 二次复检：对初筛通过的 {len(finalists)} 条源再测一轮，两轮都过才收录", flush=True)
-            kept, dropped = [], []
-
-            def revalidate_worker(it):
-                if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
-                    return it, "skipped", it['speed'], it['delay']
-                ok, speed, delay, kind, reason = evaluate_stream(it['url'])
-                if ok:
-                    return it, "pass", speed, delay
-                if kind == "decode":
-                    decode_rejects.append((it['name'], it['url'], reason))
-                return it, "fail:" + reason, speed, delay
-
-            with ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(revalidate_worker, it) for it in finalists]
-                for f in as_completed(futures):
-                    it, verdict, speed, delay = f.result()
-                    if verdict == "pass":
-                        kept.append({**it, "speed": speed, "delay": delay})
-                    elif verdict == "skipped":
-                        kept.append(it)
-                    else:
-                        dropped.append((it['name'], verdict.split(':', 1)[1]))
-
-            print(f"  复检结果：初筛 {len(finalists)} 条 → 通过 {len(kept)} 条，淘汰 {len(dropped)} 条", flush=True)
-            for c_name, reason in dropped[:15]:
-                print(f"    ↩️ {c_name} | 复检未过: {reason}", flush=True)
-
-            channel_test_results = {}
-            for it in kept:
-                channel_test_results.setdefault(it['name'], []).append(it)
 
     final_list = []
     
