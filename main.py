@@ -105,6 +105,11 @@ LENIENT_STREAM_URLS = {off['url'] for off in OFFICIAL_CHANNELS}
 # 已实测确认的污染源：上游清单把 URL 标成港臺频道名，实为外国电视台 / 纯电台流
 BLOCK_URL_TOKENS = ('rainews', 'pearlfm')
 
+# 官方源同轮重试次数。实测 RTHK32 在美区 runner 上两次被单次抽样判死（本机同一 URL 是
+# 32 MB/s / 262ms），而官方台是整份清单的保底，一次网络抖动不该让台消失，所以同轮内重试。
+# 这不是跨轮记忆——每轮仍从零重测，只是把"一次抽样"变成"最多三次抽样"。
+OFFICIAL_ATTEMPTS = 3
+
 # ffprobe 解碼級校驗：必須解析出真實視頻軌才算可播，擋掉純電臺流與空殼 m3u8。
 # CI Runner 由 workflow 的 apt-get install ffmpeg 提供 ffprobe；本機若沒裝則自動降級為僅測速。
 FFPROBE_BIN = shutil.which('ffprobe')
@@ -651,12 +656,21 @@ def generate_m3u(channels: list):
     final_list = []
     
     for off in OFFICIAL_CHANNELS:
-        ok, speed, delay, kind, reason = evaluate_stream(off['url'])
+        ok, speed, delay, reason = False, 0, float('inf'), ""
+        attempt = 1
+        for attempt in range(1, OFFICIAL_ATTEMPTS + 1):
+            ok, speed, delay, kind, reason = evaluate_stream(off['url'])
+            if ok:
+                break
+            if attempt < OFFICIAL_ATTEMPTS:
+                print(f"  ⏳ [官方源第 {attempt} 次未过] {off['name']} | {reason} | 重试", flush=True)
+                time.sleep(2)
         if ok:
             final_list.append({**off, "speed": speed, "delay": delay})
-            print(f"  🟢 [官方源已验证] {off['name']} | 速率: {speed:.2f} MB/s | 延遲: {delay:.0f} ms", flush=True)
+            note = f"（第 {attempt} 次通过）" if attempt > 1 else ""
+            print(f"  🟢 [官方源已验证] {off['name']} | 速率: {speed:.2f} MB/s | 延遲: {delay:.0f} ms {note}", flush=True)
         else:
-            print(f"  ⚠️ [官方源验证失败，已剔除] {off['name']} | {reason} | {off['url']}", flush=True)
+            print(f"  ⚠️ [官方源 {OFFICIAL_ATTEMPTS} 次均未通过，已剔除] {off['name']} | {reason} | {off['url']}", flush=True)
 
     used_keys = {stream_dedupe_key(item['url']) for item in final_list}
 
