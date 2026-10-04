@@ -18,10 +18,16 @@
 
 | 線路 | 鏈接 (URL) | 推薦度 | 說明 |
 | :--- | :--- | :--- | :--- |
-| **jsDelivr CDN (推薦)** | `https://cdn.jsdelivr.net/gh/TK073/hk-iptv-auto-custom@main/hk_live.m3u` | ⭐⭐⭐⭐⭐ | 全球節點 CDN 緩存加速，訪問高速穩定 |
-| **GitHub Raw** | `https://raw.githubusercontent.com/TK073/hk-iptv-auto-custom/refs/heads/main/hk_live.m3u` | ⭐⭐⭐ | 原始倉庫直連，適合直通海外網絡之設備 |
+| **GitHub Raw（最新）** | `https://raw.githubusercontent.com/TK073/hk-iptv-auto-custom/refs/heads/main/hk_live.m3u` | ⭐⭐⭐⭐⭐ | 每次 CI 提交後立即生效，要求最新內容的設備用這條 |
+| **jsDelivr CDN（加速）** | `https://cdn.jsdelivr.net/gh/TK073/hk-iptv-auto-custom@main/hk_live.m3u` | ⭐⭐⭐⭐ | 全球節點加速，實測緩存可達數小時（曾觀測到 Age≈28000 秒），可能拿到上一輪清單 |
 
 > 💡 **提示**：生成的 `.m3u` 已為各大播放器注入 `#EXTVLCOPT:http-user-agent`，可自動繞過反代伺服器的客戶端驗證。
+
+>
+> 💡 **同一個台會保留多條源**：輸出寫入全部通過驗證且經同流去重的源（不截最快 N 條）。主流播放器會把同名同組的多條源**折疊成一台多備用源**（如 TiviMate 的「合併相同頻道」），導入後只看到一個入口是預期行為。
+>
+> 💡 **判定是單輪抽樣、不留跨輪記憶**：每條源每次執行測一次（HTTP 逾時 5 秒、首字節延遲上限 5000 ms、`ffprobe` 必須解析出視頻軌，響應體為 HTML 落地頁直接判死），未過就本輪不寫入。因此同一天兩輪的條數會浮動，個別台也可能某一輪暫時缺席。
+>
 
 ---
 
@@ -49,16 +55,16 @@
 1.  **TVB 系列**: 翡翠台 (Jade), 無綫新聞台 (News), 明珠台 (Pearl), TVB Plus (J2), 無綫財經體育資訊台
 2.  **ViuTV 系列**: ViuTV (99台), ViuTVsix (96台)
 3.  **HOY TV 系列**: HOY TV (77台), HOY 資訊台 (78台)
-4.  **RTHK 系列**: 港台電視 31, 港台電視 32, 港台電視 33
+4.  **RTHK 系列**: 港台電視 31, 港台電視 32
 5.  **Now TV 系列**: Now 新聞台, Now 直播台
-6.  **其他資訊**: 有線新聞、有線財經等
+6.  **其他資訊**: 有線新聞台
 
 ---
 
 ## ✨ 核心技術特點 (Features)
 
-*   **🌐 雙上游動態同步 (零靜態死鏈)**:
-    *   拒絕在代碼中寫死易失效的清單，每次執行定時自動向 `youhunwl/TVAPP` 與 `ngo5/IPTV` 抓取最新內容，上游換倉換源，本地自動無感同步。
+*   **🌐 上游混合採集（精選直連 + 動態穿透）**
+    *   內含 18 個精選直連清單（`SPECIFIC_HK_DIRECT_SOURCES`），每次執行再從 6 個導航庫 README（`TARGET_README_URLS`）動態抓取上千個候選網址，解碼 TVBox 單倉／多倉與 Base64 清單後合併解析。直連清單是刻意保留的品質錨點，動態穿透負責跟住上游換倉換源。
 *   **🧬 萬能內容探針與影視倉穿透**:
     *   **單倉解析**: 自動解碼 Base64、`.png` 偽裝數據，深層提取 `lives` 節點。
     *   **多倉遞迴**: 自動展開多倉內所有子倉，遍歷挖掘隱藏電視清單。
@@ -91,7 +97,7 @@ TARGET_README_URLS = [
 ```
 
 ### 2. 修改過濾規則
-*   **白名單 (`KEYWORDS`)**: 頻道名稱**必須包含**這些關鍵字才會進入解碼候選池。
+*   **正規頻道表 (`CHANNEL_ALIASES`)**: 名稱經繁簡與「臺／台」歸一、去標點後，必須命中這裡的別名才會進入候選池；規範名即最終輸出的頻道名。別名匹配按**最長優先**，避免短別名 `viutv` 搶走 `ViuTVsix`。
 *   **黑名單 (`BLOCK_KEYWORDS`)**: 頻道名稱若包含這些關鍵字（如輪播、外國台、非港澳內容），會被**強制剔除**。
 
 ### 3. 調整頻道排序
