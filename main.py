@@ -115,6 +115,16 @@ REQUIRE_VIDEO_TRACK = True
 # 沒有預算會讓單次執行無上限拖長（本地實測拖到 9 分鐘以上仍未跑完）。
 TEST_BUDGET_SECONDS = 600
 
+# 可接受的最高首字节延迟。实测出现过「可播」但延遲 139139 ms 的源——
+# requests 的 timeout 是单次 socket 操作超时，服务器一点点吐数据就能拖到几分钟，
+# 对播放器来说这等於不可用，所以延迟超上限直接判死。
+MAX_ACCEPTABLE_DELAY_MS = 5000
+
+# 二次复检轮数：初筛通过的源再测一轮，两轮都过才进订阅表。
+# 实测港版首轮 83 条「可播」里，几分钟后立刻复测有 49 条（59%）已经连不上，
+# 单次抽样的结论不足以代表「可用」。设为 1 即关闭复检。
+REVALIDATE_ROUNDS = 2
+
 TARGET_README_URLS = [
     "https://raw.githubusercontent.com/youhunwl/TVAPP/main/README.md",
     "https://raw.githubusercontent.com/ngo5/IPTV/main/README.md",
@@ -218,6 +228,20 @@ _STATS_LOCK = threading.Lock()
 def _record_fetch(url: str, result: str):
     with _STATS_LOCK:
         FETCH_STATS[url] = result
+
+
+def looks_like_html_page(head_text: str) -> bool:
+    """识别「返回的是网页而不是流/清单」——反代失效时常见这种落地页。
+    只看 body 开头，不看 Content-Type：jdshipin 这类代理会把合法 m3u8 标成 text/html，
+    用 Content-Type 判定会误杀一大批好源。"""
+    body = (head_text or '').lstrip()[:600]
+    if not body:
+        return False
+    lowered = body.lower()
+    if '#EXTM3U' in body or '#EXTINF' in body:
+        return False
+    return (lowered.startswith('<!doctype html') or lowered.startswith('<html')
+            or lowered.startswith('<head'))
 
 
 def fetch_raw_content(url: str, timeout: int = 15) -> str:
@@ -386,6 +410,8 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
         
         text = r.text
         if '#EXTM3U' not in text:
+            if looks_like_html_page(text[:600]):
+                return False, 0, float('inf')
             delay = (time.time() - t_start) * 1000
             speed = len(r.content) / (1024 * 1024) / max((time.time() - t_start), 0.001)
             return len(r.content) > 1024, speed, delay
@@ -417,9 +443,16 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
 
         delay = (time.time() - t_seg_start) * 1000
         bytes_read = 0
+        head_bytes = b''
         t_download_start = time.time()
 
         for chunk in seg_res.iter_content(chunk_size=32768):
+            if not head_bytes:
+                head_bytes = chunk[:600]
+                if looks_like_html_page(head_bytes.decode('utf-8', 'ignore')):
+                    # 清单指向 YouTube 网页 / 落地页时，光看字节数会把它当成「能出画」
+                    seg_res.close()
+                    return False, 0, float('inf')
             bytes_read += len(chunk)
             if bytes_read >= 256 * 1024 or (time.time() - t_download_start) >= 2.5:
                 break
@@ -434,6 +467,21 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
 
     except Exception:
         return False, 0, float('inf')
+
+def evaluate_stream(url: str) -> tuple:
+    """判活的唯一入口：测速 → 延迟上限 → ffprobe 视频轨，三道门按成本从低到高排列。
+    返回 (是否可用, 速率, 延迟, 失败类别, 说明)；类别供上层区分统计。"""
+    is_alive, speed, delay = test_stream_speed(url)
+    if not is_alive:
+        return False, speed, delay, "speed", "測速未通過"
+    if delay > MAX_ACCEPTABLE_DELAY_MS:
+        return False, speed, delay, "delay", f"延遲 {delay:.0f} ms > 上限 {MAX_ACCEPTABLE_DELAY_MS} ms"
+    if FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
+        dec_ok, dec_detail = probe_video_track(url)
+        if not dec_ok:
+            return False, speed, delay, "decode", dec_detail
+    return True, speed, delay, "", ""
+
 
 @lru_cache(maxsize=8192)
 def norm_name(text: str) -> str:
@@ -567,29 +615,15 @@ def generate_m3u(channels: list):
     
     decode_rejects = []
 
-    def test_worker(ch):
-        is_alive, speed, delay = test_stream_speed(ch['url'])
-        if is_alive and FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
-            ok, detail = probe_video_track(ch['url'])
-            if not ok:
-                decode_rejects.append((ch['name'], ch['url'], detail))
-                return ch, False, speed, delay
-        return ch, is_alive, speed, delay
-
     budget_start = time.monotonic()
 
     def test_worker(ch):
         if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
             return ch, False, 0, float('inf'), "未測（超出總時間預算）"
-        is_alive, speed, delay = test_stream_speed(ch['url'])
-        if is_alive and FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
-            ok, detail = probe_video_track(ch['url'])
-            if not ok:
-                decode_rejects.append((ch['name'], ch['url'], detail))
-                return ch, False, speed, delay, detail
-        if is_alive:
-            return ch, True, speed, delay, ""
-        return ch, False, speed, delay, "測速未通過"
+        ok, speed, delay, kind, reason = evaluate_stream(ch['url'])
+        if kind == "decode":
+            decode_rejects.append((ch['name'], ch['url'], reason))
+        return ch, ok, speed, delay, reason
 
     with ThreadPoolExecutor(max_workers=15) as executor:
         futures = [executor.submit(test_worker, ch) for ch in channels]
@@ -619,16 +653,50 @@ def generate_m3u(channels: list):
         for c_name, c_url, reason in decode_rejects:
             print(f"  ⛔ {c_name} | {reason} | {c_url[:80]}", flush=True)
 
+    if REVALIDATE_ROUNDS >= 2:
+        finalists = [it for lst in channel_test_results.values() for it in lst]
+        if finalists:
+            print(f"\n🔁 二次复检：对初筛通过的 {len(finalists)} 条源再测一轮，两轮都过才收录", flush=True)
+            kept, dropped = [], []
+
+            def revalidate_worker(it):
+                if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
+                    return it, "skipped", it['speed'], it['delay']
+                ok, speed, delay, kind, reason = evaluate_stream(it['url'])
+                if ok:
+                    return it, "pass", speed, delay
+                if kind == "decode":
+                    decode_rejects.append((it['name'], it['url'], reason))
+                return it, "fail:" + reason, speed, delay
+
+            with ThreadPoolExecutor(max_workers=15) as executor:
+                futures = [executor.submit(revalidate_worker, it) for it in finalists]
+                for f in as_completed(futures):
+                    it, verdict, speed, delay = f.result()
+                    if verdict == "pass":
+                        kept.append({**it, "speed": speed, "delay": delay})
+                    elif verdict == "skipped":
+                        kept.append(it)
+                    else:
+                        dropped.append((it['name'], verdict.split(':', 1)[1]))
+
+            print(f"  复检结果：初筛 {len(finalists)} 条 → 通过 {len(kept)} 条，淘汰 {len(dropped)} 条", flush=True)
+            for c_name, reason in dropped[:15]:
+                print(f"    ↩️ {c_name} | 复检未过: {reason}", flush=True)
+
+            channel_test_results = {}
+            for it in kept:
+                channel_test_results.setdefault(it['name'], []).append(it)
+
     final_list = []
     
     for off in OFFICIAL_CHANNELS:
-        # 官方源同样要过实测：URL 失效或被换掉时不再无条件写进订阅表
-        is_alive, speed, delay = test_stream_speed(off['url'])
-        if is_alive:
+        ok, speed, delay, kind, reason = evaluate_stream(off['url'])
+        if ok:
             final_list.append({**off, "speed": speed, "delay": delay})
             print(f"  🟢 [官方源已验证] {off['name']} | 速率: {speed:.2f} MB/s | 延遲: {delay:.0f} ms", flush=True)
         else:
-            print(f"  ⚠️ [官方源验证失败，已剔除] {off['name']} | {off['url']}", flush=True)
+            print(f"  ⚠️ [官方源验证失败，已剔除] {off['name']} | {reason} | {off['url']}", flush=True)
 
     used_keys = {stream_dedupe_key(item['url']) for item in final_list}
 
