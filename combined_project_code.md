@@ -1,5 +1,5 @@
 # Complete Project Codebase
-Generated on: Sun Oct  4 09:44:23 UTC 2026
+Generated on: Sun Oct  4 10:42:39 UTC 2026
 
 ## File: main.py
 ````py
@@ -120,6 +120,16 @@ REQUIRE_VIDEO_TRACK = True
 # 沒有預算會讓單次執行無上限拖長（本地實測拖到 9 分鐘以上仍未跑完）。
 TEST_BUDGET_SECONDS = 600
 
+# 可接受的最高首字节延迟。实测出现过「可播」但延遲 139139 ms 的源——
+# requests 的 timeout 是单次 socket 操作超时，服务器一点点吐数据就能拖到几分钟，
+# 对播放器来说这等於不可用，所以延迟超上限直接判死。
+MAX_ACCEPTABLE_DELAY_MS = 5000
+
+# 二次复检轮数：初筛通过的源再测一轮，两轮都过才进订阅表。
+# 实测港版首轮 83 条「可播」里，几分钟后立刻复测有 49 条（59%）已经连不上，
+# 单次抽样的结论不足以代表「可用」。设为 1 即关闭复检。
+REVALIDATE_ROUNDS = 2
+
 TARGET_README_URLS = [
     "https://raw.githubusercontent.com/youhunwl/TVAPP/main/README.md",
     "https://raw.githubusercontent.com/ngo5/IPTV/main/README.md",
@@ -223,6 +233,20 @@ _STATS_LOCK = threading.Lock()
 def _record_fetch(url: str, result: str):
     with _STATS_LOCK:
         FETCH_STATS[url] = result
+
+
+def looks_like_html_page(head_text: str) -> bool:
+    """识别「返回的是网页而不是流/清单」——反代失效时常见这种落地页。
+    只看 body 开头，不看 Content-Type：jdshipin 这类代理会把合法 m3u8 标成 text/html，
+    用 Content-Type 判定会误杀一大批好源。"""
+    body = (head_text or '').lstrip()[:600]
+    if not body:
+        return False
+    lowered = body.lower()
+    if '#EXTM3U' in body or '#EXTINF' in body:
+        return False
+    return (lowered.startswith('<!doctype html') or lowered.startswith('<html')
+            or lowered.startswith('<head'))
 
 
 def fetch_raw_content(url: str, timeout: int = 15) -> str:
@@ -391,6 +415,8 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
         
         text = r.text
         if '#EXTM3U' not in text:
+            if looks_like_html_page(text[:600]):
+                return False, 0, float('inf')
             delay = (time.time() - t_start) * 1000
             speed = len(r.content) / (1024 * 1024) / max((time.time() - t_start), 0.001)
             return len(r.content) > 1024, speed, delay
@@ -422,9 +448,16 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
 
         delay = (time.time() - t_seg_start) * 1000
         bytes_read = 0
+        head_bytes = b''
         t_download_start = time.time()
 
         for chunk in seg_res.iter_content(chunk_size=32768):
+            if not head_bytes:
+                head_bytes = chunk[:600]
+                if looks_like_html_page(head_bytes.decode('utf-8', 'ignore')):
+                    # 清单指向 YouTube 网页 / 落地页时，光看字节数会把它当成「能出画」
+                    seg_res.close()
+                    return False, 0, float('inf')
             bytes_read += len(chunk)
             if bytes_read >= 256 * 1024 or (time.time() - t_download_start) >= 2.5:
                 break
@@ -439,6 +472,21 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
 
     except Exception:
         return False, 0, float('inf')
+
+def evaluate_stream(url: str) -> tuple:
+    """判活的唯一入口：测速 → 延迟上限 → ffprobe 视频轨，三道门按成本从低到高排列。
+    返回 (是否可用, 速率, 延迟, 失败类别, 说明)；类别供上层区分统计。"""
+    is_alive, speed, delay = test_stream_speed(url)
+    if not is_alive:
+        return False, speed, delay, "speed", "測速未通過"
+    if delay > MAX_ACCEPTABLE_DELAY_MS:
+        return False, speed, delay, "delay", f"延遲 {delay:.0f} ms > 上限 {MAX_ACCEPTABLE_DELAY_MS} ms"
+    if FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
+        dec_ok, dec_detail = probe_video_track(url)
+        if not dec_ok:
+            return False, speed, delay, "decode", dec_detail
+    return True, speed, delay, "", ""
+
 
 @lru_cache(maxsize=8192)
 def norm_name(text: str) -> str:
@@ -572,29 +620,15 @@ def generate_m3u(channels: list):
     
     decode_rejects = []
 
-    def test_worker(ch):
-        is_alive, speed, delay = test_stream_speed(ch['url'])
-        if is_alive and FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
-            ok, detail = probe_video_track(ch['url'])
-            if not ok:
-                decode_rejects.append((ch['name'], ch['url'], detail))
-                return ch, False, speed, delay
-        return ch, is_alive, speed, delay
-
     budget_start = time.monotonic()
 
     def test_worker(ch):
         if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
             return ch, False, 0, float('inf'), "未測（超出總時間預算）"
-        is_alive, speed, delay = test_stream_speed(ch['url'])
-        if is_alive and FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
-            ok, detail = probe_video_track(ch['url'])
-            if not ok:
-                decode_rejects.append((ch['name'], ch['url'], detail))
-                return ch, False, speed, delay, detail
-        if is_alive:
-            return ch, True, speed, delay, ""
-        return ch, False, speed, delay, "測速未通過"
+        ok, speed, delay, kind, reason = evaluate_stream(ch['url'])
+        if kind == "decode":
+            decode_rejects.append((ch['name'], ch['url'], reason))
+        return ch, ok, speed, delay, reason
 
     with ThreadPoolExecutor(max_workers=15) as executor:
         futures = [executor.submit(test_worker, ch) for ch in channels]
@@ -624,16 +658,50 @@ def generate_m3u(channels: list):
         for c_name, c_url, reason in decode_rejects:
             print(f"  ⛔ {c_name} | {reason} | {c_url[:80]}", flush=True)
 
+    if REVALIDATE_ROUNDS >= 2:
+        finalists = [it for lst in channel_test_results.values() for it in lst]
+        if finalists:
+            print(f"\n🔁 二次复检：对初筛通过的 {len(finalists)} 条源再测一轮，两轮都过才收录", flush=True)
+            kept, dropped = [], []
+
+            def revalidate_worker(it):
+                if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
+                    return it, "skipped", it['speed'], it['delay']
+                ok, speed, delay, kind, reason = evaluate_stream(it['url'])
+                if ok:
+                    return it, "pass", speed, delay
+                if kind == "decode":
+                    decode_rejects.append((it['name'], it['url'], reason))
+                return it, "fail:" + reason, speed, delay
+
+            with ThreadPoolExecutor(max_workers=15) as executor:
+                futures = [executor.submit(revalidate_worker, it) for it in finalists]
+                for f in as_completed(futures):
+                    it, verdict, speed, delay = f.result()
+                    if verdict == "pass":
+                        kept.append({**it, "speed": speed, "delay": delay})
+                    elif verdict == "skipped":
+                        kept.append(it)
+                    else:
+                        dropped.append((it['name'], verdict.split(':', 1)[1]))
+
+            print(f"  复检结果：初筛 {len(finalists)} 条 → 通过 {len(kept)} 条，淘汰 {len(dropped)} 条", flush=True)
+            for c_name, reason in dropped[:15]:
+                print(f"    ↩️ {c_name} | 复检未过: {reason}", flush=True)
+
+            channel_test_results = {}
+            for it in kept:
+                channel_test_results.setdefault(it['name'], []).append(it)
+
     final_list = []
     
     for off in OFFICIAL_CHANNELS:
-        # 官方源同样要过实测：URL 失效或被换掉时不再无条件写进订阅表
-        is_alive, speed, delay = test_stream_speed(off['url'])
-        if is_alive:
+        ok, speed, delay, kind, reason = evaluate_stream(off['url'])
+        if ok:
             final_list.append({**off, "speed": speed, "delay": delay})
             print(f"  🟢 [官方源已验证] {off['name']} | 速率: {speed:.2f} MB/s | 延遲: {delay:.0f} ms", flush=True)
         else:
-            print(f"  ⚠️ [官方源验证失败，已剔除] {off['name']} | {off['url']}", flush=True)
+            print(f"  ⚠️ [官方源验证失败，已剔除] {off['name']} | {reason} | {off['url']}", flush=True)
 
     used_keys = {stream_dedupe_key(item['url']) for item in final_list}
 
@@ -810,70 +878,160 @@ jobs:
 ## File: hk_live.m3u
 ````m3u
 #EXTM3U x-tvg-url="https://epg.112114.xyz/pp.xml" url-tvg="https://epg.112114.xyz/pp.xml"
-#EXTINF:-1 tvg-name="港台電視31" tvg-logo="https://epg.112114.xyz/logo/港台電視31.png" group-title="Hong Kong",港台電視31
+# Updated: 2026-10-04 17:49:18 HKT
+#EXTINF:-1 tvg-name="港台電視31" tvg-logo="https://epg.112114.xyz/logo/%E6%B8%AF%E5%8F%B0%E9%9B%BB%E8%A6%9631.png" group-title="Hong Kong",港台電視31
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://rthktv31-live.akamaized.net/hls/live/2036818/RTHKTV31/master.m3u8
-#EXTINF:-1 tvg-name="港台電視32" tvg-logo="https://epg.112114.xyz/logo/港台電視32.png" group-title="Hong Kong",港台電視32
-https://rthktv32-live.akamaized.net/hls/live/2036819/RTHKTV32/master.m3u8
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/翡翠台.png" group-title="Hong Kong",翡翠台
-http://php.jdshipin.com/TVOD/iptv.php?id=huali2
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/翡翠台.png" group-title="Hong Kong",翡翠台
-http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct3
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/翡翠台.png" group-title="Hong Kong",翡翠台
-http://r.jdshipin.com/qrfbg
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/翡翠台.png" group-title="Hong Kong",翡翠台
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/thuYX
-#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/無綫新聞台.png" group-title="Hong Kong",無綫新聞台
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/n90gt
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/qrfbg
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/GeWKr
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct3
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com/TVOD/iptv.php?id=huali2
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct4
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=j1
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/qClQf
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://185.9.2.18/chid_391/mono.m3u8
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://103.172.187.30:12000/stream/mytv/null-1/master.m3u8
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://103.172.187.30:12000/stream/mytv/null-12/master.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/CkuBd
-#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/無綫新聞台.png" group-title="Hong Kong",無綫新聞台
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com/TVOD/iptv.php?id=wxxw
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://h5cdn3.kylintv.tv/live/tvbnews_iphone.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://cdn.haititivi.com/website/haitinews/index.m3u8
-#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/無綫新聞台.png" group-title="Hong Kong",無綫新聞台
-https://rainews1-live.akamaized.net/hls/live/598326/rainews1/rainews1/playlist.m3u8
-#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/無綫新聞台.png" group-title="Hong Kong",無綫新聞台
-https://raw.githubusercontent.com/ChiSheng9/iptv/master/TV01.m3u8
-#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/明珠台.png" group-title="Hong Kong",明珠台
-http://php.jdshipin.com/TVOD/iptv.php?id=mzt
-#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/明珠台.png" group-title="Hong Kong",明珠台
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://live.i-news.tv/hls/stream.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://mumt05.tangotv.in/87NeALx2LOKSAAHI/index.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://streams.tangotv.in/PUDHARINEWS/ORIGIN/index.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://streams.tangotv.in/MATHRUBHUMINEWS/ORIGIN/index.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://cdn.pishow.tv/ott/live/411/master.m3u8
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+https://cdn.pishow.tv/ott/live/1469/master.m3u8
+#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/%E6%98%8E%E7%8F%A0%E5%8F%B0.png" group-title="Hong Kong",明珠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/ZQ4kN
-#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/明珠台.png" group-title="Hong Kong",明珠台
+#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/%E6%98%8E%E7%8F%A0%E5%8F%B0.png" group-title="Hong Kong",明珠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com/TVOD/iptv.php?id=mzt
+#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/%E6%98%8E%E7%8F%A0%E5%8F%B0.png" group-title="Hong Kong",明珠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com/TVOD/iptv.php?id=mzt2
-#EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/明珠台.png" group-title="Hong Kong",明珠台
-https://live2.tensila.com/pearl-v-1.pearlfm/hls/live/mystream.m3u8
-#EXTINF:-1 tvg-name="TVB Plus" tvg-logo="https://epg.112114.xyz/logo/TVB Plus.png" group-title="Hong Kong",TVB Plus
+#EXTINF:-1 tvg-name="TVB Plus" tvg-logo="https://epg.112114.xyz/logo/TVB%20Plus.png" group-title="Hong Kong",TVB Plus
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/Nr5jq
 #EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com/TVOD/iptv.php?id=viutv
 #EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
-http://r.jdshipin.com/vSJvl
-#EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/TcKr2
 #EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/vSJvl
+#EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com/TVOD/iptv.php?id=viutv2
-#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY TV.png" group-title="Hong Kong",HOY TV
-http://php.jdshipin.com/TVOD/iptv.php?id=hoytv
-#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY TV.png" group-title="Hong Kong",HOY TV
+#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY%20TV.png" group-title="Hong Kong",HOY TV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/sFw4S
-#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY TV.png" group-title="Hong Kong",HOY TV
+#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY%20TV.png" group-title="Hong Kong",HOY TV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com/TVOD/iptv.php?id=hoytv
+#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY%20TV.png" group-title="Hong Kong",HOY TV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://liveopen.siliconweb.com/openTvLive/liveopen/playlist.m3u8
-#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY TV.png" group-title="Hong Kong",HOY TV
+#EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY%20TV.png" group-title="Hong Kong",HOY TV
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://uc6.i-cable.com/live_freedirect/opentvhd001_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="HOY 資訊台" tvg-logo="https://epg.112114.xyz/logo/HOY 資訊台.png" group-title="Hong Kong",HOY 資訊台
-http://cdn.163189.xyz/live/hoy/stream.m3u8
-#EXTINF:-1 tvg-name="港台電視31" tvg-logo="https://epg.112114.xyz/logo/港台電視31.png" group-title="Hong Kong",港台電視31
+#EXTINF:-1 tvg-name="港台電視31" tvg-logo="https://epg.112114.xyz/logo/%E6%B8%AF%E5%8F%B0%E9%9B%BB%E8%A6%9631.png" group-title="Hong Kong",港台電視31
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com:8880/TVOD/iptv.php?id=rthk31
-#EXTINF:-1 tvg-name="港台電視32" tvg-logo="https://epg.112114.xyz/logo/港台電視32.png" group-title="Hong Kong",港台電視32
+#EXTINF:-1 tvg-name="港台電視32" tvg-logo="https://epg.112114.xyz/logo/%E6%B8%AF%E5%8F%B0%E9%9B%BB%E8%A6%9632.png" group-title="Hong Kong",港台電視32
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com:8880/TVOD/iptv.php?id=rthk32
-#EXTINF:-1 tvg-name="港台電視32" tvg-logo="https://epg.112114.xyz/logo/港台電視32.png" group-title="Hong Kong",港台電視32
-http://rthktv32-live.akamaized.net/hls/live/2036819/RTHKTV32/master.m3u8
-#EXTINF:-1 tvg-name="Now新聞台" tvg-logo="https://epg.112114.xyz/logo/Now新聞台.png" group-title="Hong Kong",Now新聞台
-http://cdn.163189.xyz/163189/now
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/有線新聞台.png" group-title="Hong Kong",有線新聞台
-http://61.10.2.140/live_freedirect/opentvhd002_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/有線新聞台.png" group-title="Hong Kong",有線新聞台
-http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/有線新聞台.png" group-title="Hong Kong",有線新聞台
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://61.10.2.141/live_freedirect/freehd209_h.live/playlist.m3u
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/有線新聞台.png" group-title="Hong Kong",有線新聞台
-http://61.10.2.141/live_freedirect/freehd209_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.141:80/live_freedirect/freehd209_h.live/chunklist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.141/live_freedirect/hd110_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140/live_freedirect/opentvhd002_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140:80/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-140.hkcable.com.hk/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/chunklist_w1949275579.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-143.hkcable.com.hk/live_freedirect/hd110_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140/live_freedirect/freehd209_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.134:80/live_freedirect/freehd209_h.live/chunklist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.151:80/live_freedirect/freehd209_h.live/chunklist_w1201085709.m3u8
 
 ````
 
