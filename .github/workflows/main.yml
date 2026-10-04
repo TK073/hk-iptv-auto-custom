@@ -2,8 +2,9 @@ name: Update IPTV Source
 
 on:
   schedule:
-    # 每天香港時間 08:00 和 20:00 運行 (UTC 00:00, 12:00)
-    - cron: '0 0,12 * * *'
+    # 每日香港時間 (UTC+8) 12:30 與 18:00 運行，對應 UTC 04:30 與 10:00
+    - cron: '30 4 * * *'
+    - cron: '0 10 * * *'
   workflow_dispatch: # 支援手動觸發
 
 permissions:
