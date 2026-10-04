@@ -1,5 +1,5 @@
 # Complete Project Codebase
-Generated on: Sun Oct  4 10:42:39 UTC 2026
+Generated on: Sun Oct  4 11:06:13 UTC 2026
 
 ## File: main.py
 ````py
@@ -124,11 +124,6 @@ TEST_BUDGET_SECONDS = 600
 # requests 的 timeout 是单次 socket 操作超时，服务器一点点吐数据就能拖到几分钟，
 # 对播放器来说这等於不可用，所以延迟超上限直接判死。
 MAX_ACCEPTABLE_DELAY_MS = 5000
-
-# 二次复检轮数：初筛通过的源再测一轮，两轮都过才进订阅表。
-# 实测港版首轮 83 条「可播」里，几分钟后立刻复测有 49 条（59%）已经连不上，
-# 单次抽样的结论不足以代表「可用」。设为 1 即关闭复检。
-REVALIDATE_ROUNDS = 2
 
 TARGET_README_URLS = [
     "https://raw.githubusercontent.com/youhunwl/TVAPP/main/README.md",
@@ -658,41 +653,6 @@ def generate_m3u(channels: list):
         for c_name, c_url, reason in decode_rejects:
             print(f"  ⛔ {c_name} | {reason} | {c_url[:80]}", flush=True)
 
-    if REVALIDATE_ROUNDS >= 2:
-        finalists = [it for lst in channel_test_results.values() for it in lst]
-        if finalists:
-            print(f"\n🔁 二次复检：对初筛通过的 {len(finalists)} 条源再测一轮，两轮都过才收录", flush=True)
-            kept, dropped = [], []
-
-            def revalidate_worker(it):
-                if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
-                    return it, "skipped", it['speed'], it['delay']
-                ok, speed, delay, kind, reason = evaluate_stream(it['url'])
-                if ok:
-                    return it, "pass", speed, delay
-                if kind == "decode":
-                    decode_rejects.append((it['name'], it['url'], reason))
-                return it, "fail:" + reason, speed, delay
-
-            with ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(revalidate_worker, it) for it in finalists]
-                for f in as_completed(futures):
-                    it, verdict, speed, delay = f.result()
-                    if verdict == "pass":
-                        kept.append({**it, "speed": speed, "delay": delay})
-                    elif verdict == "skipped":
-                        kept.append(it)
-                    else:
-                        dropped.append((it['name'], verdict.split(':', 1)[1]))
-
-            print(f"  复检结果：初筛 {len(finalists)} 条 → 通过 {len(kept)} 条，淘汰 {len(dropped)} 条", flush=True)
-            for c_name, reason in dropped[:15]:
-                print(f"    ↩️ {c_name} | 复检未过: {reason}", flush=True)
-
-            channel_test_results = {}
-            for it in kept:
-                channel_test_results.setdefault(it['name'], []).append(it)
-
     final_list = []
     
     for off in OFFICIAL_CHANNELS:
@@ -878,52 +838,46 @@ jobs:
 ## File: hk_live.m3u
 ````m3u
 #EXTM3U x-tvg-url="https://epg.112114.xyz/pp.xml" url-tvg="https://epg.112114.xyz/pp.xml"
-# Updated: 2026-10-04 17:49:18 HKT
+# Updated: 2026-10-04 18:50:39 HKT
 #EXTINF:-1 tvg-name="港台電視31" tvg-logo="https://epg.112114.xyz/logo/%E6%B8%AF%E5%8F%B0%E9%9B%BB%E8%A6%9631.png" group-title="Hong Kong",港台電視31
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://rthktv31-live.akamaized.net/hls/live/2036818/RTHKTV31/master.m3u8
 #EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/thuYX
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/n90gt
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/qrfbg
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/GeWKr
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct3
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com/TVOD/iptv.php?id=huali2
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=j1
 #EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct4
 #EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com:8880/TVOD/iptv.php?id=j1
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/GeWKr
 #EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/qClQf
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com/TVOD/iptv.php?id=huali2
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/thuYX
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://php.jdshipin.com:8880/TVOD/iptv.php?id=fct3
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/qrfbg
+#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/n90gt
 #EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://185.9.2.18/chid_391/mono.m3u8
 #EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://103.172.187.30:12000/stream/mytv/null-1/master.m3u8
-#EXTINF:-1 tvg-name="翡翠台" tvg-logo="https://epg.112114.xyz/logo/%E7%BF%A1%E7%BF%A0%E5%8F%B0.png" group-title="Hong Kong",翡翠台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://103.172.187.30:12000/stream/mytv/null-12/master.m3u8
-#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/CkuBd
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com/TVOD/iptv.php?id=wxxw
@@ -932,49 +886,37 @@ http://php.jdshipin.com/TVOD/iptv.php?id=wxxw
 https://h5cdn3.kylintv.tv/live/tvbnews_iphone.m3u8
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://r.jdshipin.com/CkuBd
+#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://cdn.haititivi.com/website/haitinews/index.m3u8
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://live.i-news.tv/hls/stream.m3u8
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-https://mumt05.tangotv.in/87NeALx2LOKSAAHI/index.m3u8
+https://streams.tangotv.in/MATHRUBHUMINEWS/ORIGIN/index.m3u8
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://streams.tangotv.in/PUDHARINEWS/ORIGIN/index.m3u8
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-https://streams.tangotv.in/MATHRUBHUMINEWS/ORIGIN/index.m3u8
+https://cdn.pishow.tv/ott/live/1469/master.m3u8
 #EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 https://cdn.pishow.tv/ott/live/411/master.m3u8
-#EXTINF:-1 tvg-name="無綫新聞台" tvg-logo="https://epg.112114.xyz/logo/%E7%84%A1%E7%B6%AB%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",無綫新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-https://cdn.pishow.tv/ott/live/1469/master.m3u8
 #EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/%E6%98%8E%E7%8F%A0%E5%8F%B0.png" group-title="Hong Kong",明珠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/ZQ4kN
+http://php.jdshipin.com/TVOD/iptv.php?id=mzt2
 #EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/%E6%98%8E%E7%8F%A0%E5%8F%B0.png" group-title="Hong Kong",明珠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://php.jdshipin.com/TVOD/iptv.php?id=mzt
 #EXTINF:-1 tvg-name="明珠台" tvg-logo="https://epg.112114.xyz/logo/%E6%98%8E%E7%8F%A0%E5%8F%B0.png" group-title="Hong Kong",明珠台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com/TVOD/iptv.php?id=mzt2
+http://r.jdshipin.com/ZQ4kN
 #EXTINF:-1 tvg-name="TVB Plus" tvg-logo="https://epg.112114.xyz/logo/TVB%20Plus.png" group-title="Hong Kong",TVB Plus
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/Nr5jq
-#EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com/TVOD/iptv.php?id=viutv
-#EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/TcKr2
-#EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://r.jdshipin.com/vSJvl
-#EXTINF:-1 tvg-name="ViuTV" tvg-logo="https://epg.112114.xyz/logo/ViuTV.png" group-title="Hong Kong",ViuTV
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://php.jdshipin.com/TVOD/iptv.php?id=viutv2
 #EXTINF:-1 tvg-name="HOY TV" tvg-logo="https://epg.112114.xyz/logo/HOY%20TV.png" group-title="Hong Kong",HOY TV
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://r.jdshipin.com/sFw4S
@@ -995,37 +937,37 @@ http://php.jdshipin.com:8880/TVOD/iptv.php?id=rthk31
 http://php.jdshipin.com:8880/TVOD/iptv.php?id=rthk32
 #EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-140.hkcable.com.hk/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140/live_freedirect/freehd209_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.141/live_freedirect/hd110_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/chunklist_w1949275579.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://cm61-10-2-143.hkcable.com.hk/live_freedirect/hd110_h.live/playlist.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
+http://61.10.2.140:80/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
+#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
+#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://61.10.2.141/live_freedirect/freehd209_h.live/playlist.m3u
 #EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://61.10.2.141:80/live_freedirect/freehd209_h.live/chunklist.m3u8
 #EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://61.10.2.141/live_freedirect/hd110_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://61.10.2.140/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://61.10.2.140/live_freedirect/opentvhd002_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://61.10.2.140:80/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://cm61-10-2-140.hkcable.com.hk/live_freedirect/freehd209_h.live/chunklist_w135209556.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/chunklist_w1949275579.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://cm61-10-2-143.hkcable.com.hk/live_freedirect/freehd209_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://cm61-10-2-143.hkcable.com.hk/live_freedirect/hd110_h.live/playlist.m3u8
-#EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
-#EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
-http://61.10.2.140/live_freedirect/freehd209_h.live/playlist.m3u8
 #EXTINF:-1 tvg-name="有線新聞台" tvg-logo="https://epg.112114.xyz/logo/%E6%9C%89%E7%B7%9A%E6%96%B0%E8%81%9E%E5%8F%B0.png" group-title="Hong Kong",有線新聞台
 #EXTVLCOPT:http-user-agent=okhttp/3.15.0 (Linux; Android 11; TVBox)
 http://61.10.2.134:80/live_freedirect/freehd209_h.live/chunklist.m3u8
