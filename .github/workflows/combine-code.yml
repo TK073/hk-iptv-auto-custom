@@ -1,12 +1,7 @@
 name: Generate All Codebase to MD
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - 'combined_project_code.md' # 避免此檔案自身更新引發無限循環
-  workflow_dispatch: # 支援在 GitHub 網頁上手動觸發執行
+  workflow_dispatch: # 只在需要重新生成代码快照时手动触发。原来是 on: push，它会与自动更新工作流同时往 main 推送，把对方的提交挤成 non-fast-forward 失败
 
 permissions:
   contents: write

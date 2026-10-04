@@ -6,6 +6,11 @@ on:
     - cron: '0 4,10 * * *'
   workflow_dispatch: # 支援手動觸發
 
+# 两个工作流都会往 main 推提交，让它们排队而不是并发，避免后完成者被 non-fast-forward 拒掉
+concurrency:
+  group: main-write
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -39,4 +44,6 @@ jobs:
         git config --local user.name "GitHub Action"
         git add hk_live.m3u
         git commit -m "Auto-update channel list [skip ci]" || echo "No changes to commit"
+        git pull --rebase --autostash origin main
+        # 兜底：运行期间 main 若已被其他提交推进，把自己的提交接到后面再推
         git push
