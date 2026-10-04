@@ -1,0 +1,4 @@
+# 仓库内文本文件一律以 LF 存 blob、以 LF 签出。
+# 之前没这个文件：Windows 上 core.autocrlf=true 会把签出的 main.py / hk_live.m3u 变成 CRLF，
+# 脚本改写时又变回 LF，造成"整文件行尾抖动"和难以判断的真实差异。
+* text=auto eol=lf
