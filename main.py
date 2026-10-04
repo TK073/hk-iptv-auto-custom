@@ -3,9 +3,15 @@ import re
 import json
 import base64
 import time
+import shutil
+import socket
+import subprocess
+import threading
 import datetime
 from urllib.parse import urlparse, urlunparse, quote, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from functools import lru_cache
 from opencc import OpenCC
 import m3u8
 
@@ -71,6 +77,12 @@ CHANNEL_ALIASES = {
     ]
 }
 
+# 用字歸一：先用 OpenCC 把任意繁簡寫法統一成繁體，再用下表把「臺」併為「台」，
+# 最後由 norm_name 去掉空白與標點。CHANNEL_ALIASES 因此不必窮舉簡繁兩套寫法
+# （原實例只收了繁體「無線/無綫」寫法，簡體「无线新闻台」等 12+ 條上游條目全部漏配）。
+_POST_FOLD = str.maketrans({'臺': '台'})
+_NAME_DROP = frozenset(' \t-_·.()（）[]【】<>《》,，、:：|/"\\\'')
+
 # 最終輸出的頻道順序 (按照香港收視習慣)
 ORDER_KEYWORDS = [
     "翡翠台", "無綫新聞台", "明珠台", "TVB Plus", "無綫財經體育資訊台",
@@ -80,12 +92,28 @@ ORDER_KEYWORDS = [
     "Now新聞台", "Now直播台", "有線新聞台"
 ]
 
-MAX_URLS_PER_CHANNEL = 4
-
 OFFICIAL_CHANNELS = [
     {"name": "港台電視31", "url": "https://rthktv31-live.akamaized.net/hls/live/2036818/RTHKTV31/master.m3u8"},
     {"name": "港台電視32", "url": "https://rthktv32-live.akamaized.net/hls/live/2036819/RTHKTV32/master.m3u8"}
 ]
+
+# 取代原先的「整域放行」：只有这两条精确 URL 享受宽松字节阈值。
+# 原先 main.py 对任何含 akamaized.net 的 URL 直接判可播，等于跳过整条 CDN 域名的校验，
+# 意大利 RAI News24、越南 Pearl FM 电台因此能顶着港台频道名混进输出。
+LENIENT_STREAM_URLS = {off['url'] for off in OFFICIAL_CHANNELS}
+
+# 已实测确认的污染源：上游清单把 URL 标成港臺频道名，实为外国电视台 / 纯电台流
+BLOCK_URL_TOKENS = ('rainews', 'pearlfm')
+
+# ffprobe 解碼級校驗：必須解析出真實視頻軌才算可播，擋掉純電臺流與空殼 m3u8。
+# CI Runner 由 workflow 的 apt-get install ffmpeg 提供 ffprobe；本機若沒裝則自動降級為僅測速。
+FFPROBE_BIN = shutil.which('ffprobe')
+FFPROBE_TIMEOUT = 12
+REQUIRE_VIDEO_TRACK = True
+
+# 測速+解碼階段的總時間預算。候選數已從 181 漲到 240+，再疊加 ffprobe，
+# 沒有預算會讓單次執行無上限拖長（本地實測拖到 9 分鐘以上仍未跑完）。
+TEST_BUDGET_SECONDS = 600
 
 TARGET_README_URLS = [
     "https://raw.githubusercontent.com/youhunwl/TVAPP/main/README.md",
@@ -98,7 +126,6 @@ TARGET_README_URLS = [
 
 # 你指定的所有高品質直連清單
 SPECIFIC_HK_DIRECT_SOURCES = [
-    "https://iptv-org.github.io/iptv/index.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/hk.m3u",
     "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_hong_kong.m3u8",
     "https://raw.githubusercontent.com/s14685/tv/main/iptvhk.txt",
@@ -145,15 +172,68 @@ def clean_and_encode_url(url: str) -> str:
     except Exception:
         return url
 
+def stream_dedupe_key(url: str) -> str:
+    """同一流的去重鍵：忽略 http/https 協定差異、尾斜杠，以及 .m3u / .m3u8 後綴差異。
+    原本只比 URL 全等，導致同一條 RTHK32 流的 https 與 http 兩版同時進輸出。"""
+    parts = urlparse(clean_and_encode_url(url).rstrip('/'))
+    path = parts.path.lower()
+    for ext in ('.m3u8', '.m3u'):
+        if path.endswith(ext):
+            path = path[:-len(ext)]
+            break
+    return f"{parts.netloc.lower()}|{path}|{parts.query}"
+
+# IPv6 來源識別：清單檔名本身帶 ipv6/v6 標記，或流地址是 IPv6 字面量（[::1] 形式）。
+# GitHub Runner 有 IPv6 連得通，但普通用戶的網路往往只有 IPv4，播不出來就被算成「可播」。
+# 這類源不直接丟棄，而是分組標示，避免「CI 全綠、用戶黑屏」。
+IPV6_SOURCE_RE = re.compile(r'ipv6|ipvv6|pdx-v6|/v6', re.I)
+
+
+def looks_ipv6(stream_url: str, source_url: str = "") -> bool:
+    host = urlparse(stream_url).hostname or ''
+    if host.startswith('['):
+        return True
+    return bool(source_url and IPV6_SOURCE_RE.search(source_url))
+
+
+@lru_cache(maxsize=512)
+def host_has_ipv4(host: str) -> bool:
+    try:
+        return any(i[0] == socket.AF_INET for i in socket.getaddrinfo(host, None))
+    except OSError:
+        return False
+
+
+def is_ipv6_only(stream_url: str) -> bool:
+    host = urlparse(stream_url).hostname or ''
+    if host.startswith('['):
+        return True
+    return bool(host) and not host_has_ipv4(host)
+
+FETCH_STATS = {}      # url -> 抓取結果 ('OK' / 'HTTP 404' / '逾時' / '連不上' / '異常 Xxx')
+PLAYLIST_STATS = {}   # 播放列表 url -> {'entries': 名條目數, 'hits': 命中頻道數, 'v6': 疑似純 IPv6}
+_STATS_LOCK = threading.Lock()
+
+
+def _record_fetch(url: str, result: str):
+    with _STATS_LOCK:
+        FETCH_STATS[url] = result
+
+
 def fetch_raw_content(url: str, timeout: int = 15) -> str:
     safe_url = clean_and_encode_url(url)
     try:
         r = requests.get(safe_url, headers=HEADERS, timeout=timeout)
+        if r.status_code != 200:
+            _record_fetch(safe_url, f"HTTP {r.status_code}")
+            return ""
         r.encoding = 'utf-8'
-        if r.status_code == 200:
-            return r.text
-    except Exception:
-        pass
+        _record_fetch(safe_url, "OK")
+        return r.text
+    except requests.exceptions.Timeout:
+        _record_fetch(safe_url, "逾時")
+    except requests.exceptions.RequestException as exc:
+        _record_fetch(safe_url, f"異常 {type(exc).__name__}")
     return ""
 
 def parse_tvbox_payload(text: str) -> dict:
@@ -259,11 +339,44 @@ def extract_all_sources() -> list:
 
 # --- 3. Guovin 測速與分片驗證引擎 ---
 
+def probe_video_track(url: str, timeout: int = FFPROBE_TIMEOUT) -> tuple:
+    """用 ffprobe 實解封包，必須出現 video 軌才算真視頻流。
+    回傳 (是否通過, 描述)；未通過時描述即原因，方便定位電臺流 / 空殼清單 / 逾時。"""
+    safe_url = clean_and_encode_url(url)
+    try:
+        proc = subprocess.run(
+            [FFPROBE_BIN, '-hide_banner', '-v', 'error', '-print_format', 'json',
+             '-show_entries', 'stream=codec_type,codec_name,width,height',
+             '-show_entries', 'format=format_name,bit_rate',
+             '-analyzeduration', '3000000', '-probesize', '1000000',
+             '-user_agent', IPTV_UA, safe_url],
+            capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return False, "ffprobe 逾時"
+    except Exception as exc:
+        return False, f"ffprobe 異常 {type(exc).__name__}"
+
+    try:
+        info = json.loads(proc.stdout or '{}')
+    except Exception:
+        return False, (proc.stderr.strip()[:70] or 'ffprobe 輸出非 JSON')
+
+    streams = info.get('streams', [])
+    videos = [s for s in streams if s.get('codec_type') == 'video' and (s.get('width') or 0) > 0]
+    if not videos:
+        kinds = ','.join(sorted({s.get('codec_type', '?') for s in streams})) or '無任何流'
+        return False, f"無視頻軌({kinds})"
+    v = videos[0]
+    fmt = info.get('format', {}).get('format_name', '?')
+    return True, f"{v.get('codec_name')} {v.get('width')}x{v.get('height')} [{fmt}]"
+
+
 def test_stream_speed(url: str, timeout: int = 5) -> tuple:
     safe_url = clean_and_encode_url(url)
     
-    if any(d in safe_url.lower() for d in ['rthk.hk', 'akamaized.net']):
-        return True, 5.0, 50.0
+    if any(tok in safe_url.lower() for tok in BLOCK_URL_TOKENS):
+        return False, 0, float('inf')
 
     t_start = time.time()
     try:
@@ -315,26 +428,42 @@ def test_stream_speed(url: str, timeout: int = 5) -> tuple:
         elapsed = time.time() - t_download_start
         speed = (bytes_read / (1024 * 1024)) / max(elapsed, 0.001)
 
-        is_alive = bytes_read >= 40 * 1024
+        min_bytes = 4 * 1024 if safe_url in LENIENT_STREAM_URLS else 40 * 1024
+        is_alive = bytes_read >= min_bytes
         return is_alive, speed, delay
 
     except Exception:
         return False, 0, float('inf')
 
+@lru_cache(maxsize=8192)
+def norm_name(text: str) -> str:
+    compacted = ''.join(c for c in text.lower() if c not in _NAME_DROP)
+    return cc.convert(compacted).translate(_POST_FOLD)
+
+# 最長別名優先，避免短別名 ('viutv') 搶走長別名 ('viutvsix') 的歸屬
+_ALIAS_INDEX = sorted(
+    ((norm_name(a), std) for std, aliases in CHANNEL_ALIASES.items() for a in aliases),
+    key=lambda pair: (-len(pair[0]), pair[0])
+)
+
 def match_standard_channel_name(raw_name: str) -> str:
-    clean_n = raw_name.lower().replace(" ", "").replace("-", "")
-    for std_name, aliases in CHANNEL_ALIASES.items():
-        for a in aliases:
-            if a.lower().replace(" ", "").replace("-", "") in clean_n:
-                return std_name
+    clean_n = norm_name(raw_name)
+    if not clean_n:
+        return ""
+    for alias, std_name in _ALIAS_INDEX:
+        if alias in clean_n:
+            return std_name
     return ""
 
 def parse_single_playlist(source_url: str) -> list:
     channels = []
     # 對巨型檔案給予 20 秒充足下載時間
-    timeout = 20 if "index.m3u" in source_url else 12
-    content = fetch_raw_content(source_url, timeout=timeout)
+    content = fetch_raw_content(source_url, timeout=12)
+    v6_hint = looks_ipv6("", source_url)
+    entries = hits = 0
     if not content:
+        with _STATS_LOCK:
+            PLAYLIST_STATS[source_url] = {"entries": 0, "hits": 0, "v6": v6_hint}
         return channels
 
     lines = [l.strip() for l in content.split('\n') if l.strip()]
@@ -349,11 +478,14 @@ def parse_single_playlist(source_url: str) -> list:
                     current_raw_name = match.group(1).strip()
             elif line.startswith("http"):
                 stream_url = line.split('$')[0].strip()
+                entries += 1
                 if current_raw_name:
                     if not any(b.lower() in current_raw_name.lower() for b in BLOCK_KEYWORDS):
                         std_name = match_standard_channel_name(current_raw_name)
                         if std_name:
-                            channels.append({"name": std_name, "raw_name": current_raw_name, "url": stream_url})
+                            hits += 1
+                            channels.append({"name": std_name, "raw_name": current_raw_name,
+                                             "url": stream_url, "v6": v6_hint or looks_ipv6(stream_url)})
                 current_raw_name = ""
         else:
             if ',' in line and not line.startswith('http'):
@@ -362,18 +494,42 @@ def parse_single_playlist(source_url: str) -> list:
                     raw_n = parts[0].strip()
                     url_p = parts[1].split('$')[0].strip()
                     if url_p.startswith('http'):
+                        entries += 1
                         if not any(b.lower() in raw_n.lower() for b in BLOCK_KEYWORDS):
                             std_name = match_standard_channel_name(raw_n)
                             if std_name:
-                                channels.append({"name": std_name, "raw_name": raw_n, "url": url_p})
+                                hits += 1
+                                channels.append({"name": std_name, "raw_name": raw_n,
+                                                 "url": url_p, "v6": v6_hint or looks_ipv6(url_p)})
 
+    with _STATS_LOCK:
+        PLAYLIST_STATS[source_url] = {"entries": entries, "hits": hits, "v6": v6_hint}
     return channels
 
 # --- 4. 主執行流程 ---
 
+def print_source_health_report(total_sources: int):
+    """摊开上游健康度：谁挂了、谁零贡献、谁的命中率极低——原先这些全被静默吞掉。"""
+    dead = {u: r for u, r in FETCH_STATS.items() if r != "OK"}
+    reasons = Counter(r.split()[0] for r in dead.values())
+    hit_pairs = sorted(PLAYLIST_STATS.items(), key=lambda kv: -kv[1]["hits"])
+    contributing = [kv for kv in hit_pairs if kv[1]["hits"] > 0]
+
+    print("\n📋 上游健康度报告", flush=True)
+    print(f"  清單來源 {total_sources}｜成功解析 {len(PLAYLIST_STATS)}｜有貢獻 {len(contributing)}｜零貢獻 {len(PLAYLIST_STATS) - len(contributing)}", flush=True)
+    print(f"  抓取失敗 {len(dead)} 筆，原因分佈: {dict(reasons) if reasons else '無'}", flush=True)
+    print("  產出最高的來源（命中 / 名條目數，比値越低說明清單越杂）:", flush=True)
+    for url, st in contributing[:10]:
+        rate = st["hits"] / st["entries"] * 100 if st["entries"] else 0
+        print(f"    {st['hits']:>4} / {st['entries']:>6} ({rate:4.1f}%)  {url[:86]}", flush=True)
+    print("  失敗且屬於本次來源清單的上游:", flush=True)
+    for url, reason in sorted((u, r) for u, r in dead.items() if u in PLAYLIST_STATS)[:12]:
+        print(f"    [{reason}] {url[:86]}", flush=True)
+
+
 def fetch_and_parse() -> list:
     found_channels = []
-    seen_urls = set()
+    seen_keys = set()
 
     playlist_sources = extract_all_sources()
     print(f"\n🚀 開始並行解析 {len(playlist_sources)} 個清單中的香港電視頻道...", flush=True)
@@ -386,51 +542,95 @@ def fetch_and_parse() -> list:
                 ch_list = f.result()
                 added = 0
                 for ch in ch_list:
-                    if ch['url'] not in seen_urls:
-                        seen_urls.add(ch['url'])
+                    key = stream_dedupe_key(ch['url'])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
                         found_channels.append(ch)
                         added += 1
                 if added > 0:
                     tag = "【直連清單】" if any(d in source_url for d in SPECIFIC_HK_DIRECT_SOURCES) else "【影視倉源】"
                     print(f"  ⭐ {tag} 貢獻 {added} 個有效候選香港台: {source_url}", flush=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                with _STATS_LOCK:
+                    FETCH_STATS[source_url] = f"解析異常 {type(exc).__name__}"
 
     print(f"\n📊 全部解析完畢，共提取到 {len(found_channels)} 個香港電視候選串流。", flush=True)
+    print_source_health_report(len(playlist_sources))
     return found_channels
 
 def generate_m3u(channels: list):
+    if not FFPROBE_BIN:
+        print("\n⚠️ 本机未检测到 ffprobe，跳过解码级校验（GitHub Runner 已安装 ffmpeg，会执行校验）", flush=True)
     print(f"\n⚡ 正在啟動【Guovin 測速引擎】：實測下載速率 (Speed) 與 延遲 (Delay)...", flush=True)
     
     channel_test_results = {}
     
+    decode_rejects = []
+
     def test_worker(ch):
         is_alive, speed, delay = test_stream_speed(ch['url'])
+        if is_alive and FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
+            ok, detail = probe_video_track(ch['url'])
+            if not ok:
+                decode_rejects.append((ch['name'], ch['url'], detail))
+                return ch, False, speed, delay
         return ch, is_alive, speed, delay
+
+    budget_start = time.monotonic()
+
+    def test_worker(ch):
+        if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
+            return ch, False, 0, float('inf'), "未測（超出總時間預算）"
+        is_alive, speed, delay = test_stream_speed(ch['url'])
+        if is_alive and FFPROBE_BIN and REQUIRE_VIDEO_TRACK:
+            ok, detail = probe_video_track(ch['url'])
+            if not ok:
+                decode_rejects.append((ch['name'], ch['url'], detail))
+                return ch, False, speed, delay, detail
+        if is_alive:
+            return ch, True, speed, delay, ""
+        return ch, False, speed, delay, "測速未通過"
 
     with ThreadPoolExecutor(max_workers=15) as executor:
         futures = [executor.submit(test_worker, ch) for ch in channels]
         for f in as_completed(futures):
-            ch, is_alive, speed, delay = f.result()
+            ch, is_alive, speed, delay, reason = f.result()
             c_name = ch['name']
             if c_name not in channel_test_results:
                 channel_test_results[c_name] = []
-            
+
             if is_alive:
                 channel_test_results[c_name].append({
                     "name": c_name,
                     "url": ch['url'],
                     "speed": speed,
-                    "delay": delay
+                    "delay": delay,
+                    "v6": ch.get('v6', False)
                 })
                 print(f"  🟢 [可播] {c_name} | 速率: {speed:.2f} MB/s | 延遲: {delay:.0f} ms", flush=True)
             else:
-                print(f"  🔴 [不可播/逾時] {c_name}", flush=True)
+                print(f"  🔴 [不可播] {c_name} | {reason}", flush=True)
+
+    if time.monotonic() - budget_start > TEST_BUDGET_SECONDS:
+        print(f"\n⏱️ 已用滿 {TEST_BUDGET_SECONDS}s 時間預算，剩餘候選未測速", flush=True)
+
+    if decode_rejects:
+        print(f"\n🔬 ffprobe 解码校验剔除 {len(decode_rejects)} 条「能下载但无视频轨」的源：", flush=True)
+        for c_name, c_url, reason in decode_rejects:
+            print(f"  ⛔ {c_name} | {reason} | {c_url[:80]}", flush=True)
 
     final_list = []
     
     for off in OFFICIAL_CHANNELS:
-        final_list.append(off)
+        # 官方源同样要过实测：URL 失效或被换掉时不再无条件写进订阅表
+        is_alive, speed, delay = test_stream_speed(off['url'])
+        if is_alive:
+            final_list.append({**off, "speed": speed, "delay": delay})
+            print(f"  🟢 [官方源已验证] {off['name']} | 速率: {speed:.2f} MB/s | 延遲: {delay:.0f} ms", flush=True)
+        else:
+            print(f"  ⚠️ [官方源验证失败，已剔除] {off['name']} | {off['url']}", flush=True)
+
+    used_keys = {stream_dedupe_key(item['url']) for item in final_list}
 
     for c_name in ORDER_KEYWORDS:
         candidates = channel_test_results.get(c_name, [])
@@ -438,18 +638,27 @@ def generate_m3u(channels: list):
             continue
         
         candidates.sort(key=lambda x: (-x['speed'], x['delay']))
-        selected = candidates[:MAX_URLS_PER_CHANNEL]
-        for item in selected:
-            if not any(f['url'] == item['url'] for f in final_list):
-                final_list.append(item)
+        for item in candidates:
+            key = stream_dedupe_key(item['url'])
+            if key in used_keys:
+                continue
+            used_keys.add(key)
+            final_list.append(item)
 
     # 輸出 MoonTV / TiviMate 標準兩行格式
     lines = ['#EXTM3U x-tvg-url="https://epg.112114.xyz/pp.xml" url-tvg="https://epg.112114.xyz/pp.xml"']
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_hkt = now_utc.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+    lines.append(f'# Updated: {now_hkt.strftime("%Y-%m-%d %H:%M:%S")} HKT')
 
     for item in final_list:
         name = item["name"]
-        logo_url = f"https://epg.112114.xyz/logo/{name}.png"
-        lines.append(f'#EXTINF:-1 tvg-name="{name}" tvg-logo="{logo_url}" group-title="Hong Kong",{name}')
+        # logo 路徑含中文，必須 percent-encode，否則严格的 HTTP 客户端直接报 unicode 错误
+        logo_url = "https://epg.112114.xyz/logo/" + quote(f"{name}.png", safe='')
+        group = "Hong Kong [IPv6]" if item.get("v6") and is_ipv6_only(item["url"]) else "Hong Kong"
+        lines.append(f'#EXTINF:-1 tvg-name="{name}" tvg-logo="{logo_url}" group-title="{group}",{name}')
+        # 把取流用的 UA 一起写进订阅表，播放器才能复现脚本端的可播结果
+        lines.append(f'#EXTVLCOPT:http-user-agent={IPTV_UA}')
         lines.append(f'{item["url"]}')
 
     content = "\n".join(lines) + "\n"
@@ -457,7 +666,7 @@ def generate_m3u(channels: list):
     with open("hk_live.m3u", "w", encoding="utf-8") as f:
         f.write(content)
 
-    print(f"\n🎉 測速與篩選完成！已精選導出 {len(final_list)} 條最高速、可秒播的香港電視頻道。", flush=True)
+    print(f"\n✅ 匯出完成：{len(final_list)} 條已驗證可播、且經同流去重的香港電視頻道。", flush=True)
 
 if __name__ == "__main__":
     candidates = fetch_and_parse()
