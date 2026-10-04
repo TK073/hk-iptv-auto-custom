@@ -1,5 +1,5 @@
 # Complete Project Codebase
-Generated on: Sun Oct  4 09:42:30 UTC 2026
+Generated on: Sun Oct  4 09:44:23 UTC 2026
 
 ## File: main.py
 ````py
@@ -685,9 +685,8 @@ name: Update IPTV Source
 
 on:
   schedule:
-    # 每日香港時間 (UTC+8) 12:30 與 18:00 運行，對應 UTC 04:30 與 10:00
-    - cron: '30 4 * * *'
-    - cron: '0 10 * * *'
+    # 每日香港時間 (UTC+8) 12:00 與 18:00 運行，對應 UTC 04:00 與 10:00
+    - cron: '0 4,10 * * *'
   workflow_dispatch: # 支援手動觸發
 
 permissions:
