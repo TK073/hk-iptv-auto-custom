@@ -1,9 +1,13 @@
 # 📺 HK IPTV Auto Updater | 香港電視台直播源自動更新
 
-![Update Status](https://github.com/sammy0101/hk-iptv-auto/actions/workflows/main.yml/badge.svg)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Update Status](https://github.com/TK073/hk-iptv-auto-custom/actions/workflows/main.yml/badge.svg)
+![Derived from](https://img.shields.io/badge/derived%20from-sammy0101%2Fhk--iptv--auto-informational)
 
-這是一個基於 **GitHub Actions** 的全自動化香港電視 IPTV 聚合過濾專案。  
+> ### ⚠️ 本倉庫性質 (About this copy)
+> 這是 [sammy0101/hk-iptv-auto](https://github.com/sammy0101/hk-iptv-auto) 的**個人副本**，完整保留上游 Git 歷史（661 次提交，同步點 `af8af17`，2026-10-04）。原始專案由 **sammy0101**（提交身分 `SWvs`／`sammy0101`）撰寫與維護，本副本**不主張任何原創著作權**，僅用於個人學習、自建 CI 與線路測試。本副本自身的改動，記錄在 `af8af17` 之後的提交裡。
+> 上游 README 掛有 MIT badge，但倉庫內**沒有 LICENSE 檔案**，授權條款並不明確；本副本不重新聲明許可證。
+
+這是一個基於 **GitHub Actions** 的全自動化香港電視 IPTV 聚合過濾專案，**衍生自上述上游專案**。  
 系統捨棄了傳統靜態易失效的死鏈清單，採用**動態上游雙引擎解析架構**，每日自動穿透各大影視倉與在線源，配合 **`ffprobe` 真機解碼級檢測**、**播放器 UA 標頭注入**、**OpenCC 港式繁體標準化** 與 **收視優先級自動排序**，生成實質可出畫面的純淨香港電視直播清單 (`.m3u`)。
 
 ---
@@ -14,8 +18,8 @@
 
 | 線路 | 鏈接 (URL) | 推薦度 | 說明 |
 | :--- | :--- | :--- | :--- |
-| **jsDelivr CDN (推薦)** | `https://cdn.jsdelivr.net/gh/sammy0101/hk-iptv-auto@main/hk_live.m3u` | ⭐⭐⭐⭐⭐ | 全球節點 CDN 緩存加速，訪問高速穩定 |
-| **GitHub Raw** | `https://raw.githubusercontent.com/sammy0101/hk-iptv-auto/refs/heads/main/hk_live.m3u` | ⭐⭐⭐ | 原始倉庫直連，適合直通海外網絡之設備 |
+| **jsDelivr CDN (推薦)** | `https://cdn.jsdelivr.net/gh/TK073/hk-iptv-auto-custom@main/hk_live.m3u` | ⭐⭐⭐⭐⭐ | 全球節點 CDN 緩存加速，訪問高速穩定 |
+| **GitHub Raw** | `https://raw.githubusercontent.com/TK073/hk-iptv-auto-custom/refs/heads/main/hk_live.m3u` | ⭐⭐⭐ | 原始倉庫直連，適合直通海外網絡之設備 |
 
 > 💡 **提示**：生成的 `.m3u` 已為各大播放器注入 `#EXTVLCOPT:http-user-agent`，可自動繞過反代伺服器的客戶端驗證。
 
@@ -94,7 +98,7 @@ TARGET_README_URLS = [
 編輯 `ORDER_KEYWORDS` 列表，排名越靠前的關鍵字，在產生的 `.m3u` 中位置越靠前。
 
 ### 4. 修改訂閱鏈接
-Fork 之後，請編輯 `README.md`，將訂閱地址中的 `sammy0101` 替換為你的 GitHub 用戶名：
+Fork 或衍生本倉庫之後，請編輯 `README.md`，將訂閱地址中的 `TK073/hk-iptv-auto-custom` 替換為你的 `用戶名/倉庫名`：
 *   **jsDelivr 格式範例**:
     `https://cdn.jsdelivr.net/gh/<你的用戶名>/<倉庫名稱>@main/hk_live.m3u`
 
